@@ -17,6 +17,52 @@ import java.util.Arrays;
 // Called by RE2.doExecute.
 class Machine {
 
+  /**
+   * Sink for low-volume execution observations of the NFA simulation. Intended for in-package tests
+   * and diagnostics only: it is not part of the public API and every method has an empty default so
+   * that ordinary matches pay no observer cost beyond the (guarded) call site.
+   *
+   * <p>
+   * All position and capture values are in the units of the active {@link MachineInput} (UTF-16
+   * code units for {@link CharSequence} inputs).
+   */
+  abstract static class Tracer {
+    // add() is about to visit pc while filling q.  kind is one of
+    // "start", "alt-out", "alt-arg", "empty", "nop", "cap", "after-rune".
+    void visit(int qid, int pc, int pos, String kind) {}
+
+    // q already contained pc, so the thread was not added again.
+    void dedup(int qid, int pc) {}
+
+    // An EMPTY_WIDTH instruction failed its context check and was pruned.
+    void emptyRejected(int qid, int pc, int want, int have) {}
+
+    // A capture slot is transiently set while filling q.
+    void captureSet(int qid, int slot, int oldPos, int newPos) {}
+
+    // A rune-consuming (or MATCH) thread is now parked in q with a pc and cap snapshot.
+    void park(int qid, int pc, int pos, int[] cap) {}
+
+    // A new input-position round starts; runq holds the threads about to consume the rune at pos.
+    void stepBegin(int round, int runqId, int pos, int rune) {}
+
+    // The round finished; pcs (and caps) describe nextq after fan-out to the next position.
+    void stepEnd(int round, int nextqId, int nextPos, int[] pcs, int[][] caps) {}
+
+    // A thread reached MATCH at pos and its cap snapshot became (or, in longest mode, was
+    // considered against) the match result.
+    void matchWin(int pos, int[] cap, boolean replace) {}
+
+    // In leftmost-first mode, all remaining queued threads were pruned once a match was found.
+    void pruneTail(int qid, int from) {}
+
+    // The whole match() run finished.
+    void finish(boolean matched, int[] matchcap) {}
+
+    // The literal-prefix accelerator skipped the cursor by advance units.
+    void prefixSkip(int pos, int advance) {}
+  }
+
   // A logical thread in the NFA.
   private static class Thread {
     Thread(int n) {
@@ -31,12 +77,14 @@ class Machine {
   // research.swtch.com/2008/03/using-uninitialized-memory-for-fun-and.html
   private static class Queue {
 
+    final int id;
     final Thread[] denseThreads; // may contain stale Thread in slots >= size
     final int[] densePcs; // may contain stale pc in slots >= size
     final int[] sparse; // may contain stale but in-bounds values.
     int size; // of prefix of |dense| that is logically populated
 
-    Queue(int n) {
+    Queue(int id, int n) {
+      this.id = id;
       this.sparse = new int[n];
       this.densePcs = new int[n];
       this.denseThreads = new Thread[n];
@@ -99,6 +147,9 @@ class Machine {
   private int[] matchcap;
   private int ncap;
 
+  // Optional in-package observer.  Null in all ordinary matching.
+  Tracer tracer;
+
   // Make sure to include new fields in the copy constructor
 
   // Pointer to form a linked stack for the pool of Machines. Not included in copy constructor.
@@ -110,8 +161,8 @@ class Machine {
   Machine(RE2 re2) {
     this.prog = re2.prog;
     this.re2 = re2;
-    this.q0 = new Queue(prog.numInst());
-    this.q1 = new Queue(prog.numInst());
+    this.q0 = new Queue(0, prog.numInst());
+    this.q1 = new Queue(1, prog.numInst());
     this.matchcap = new int[prog.numCap < 2 ? 2 : prog.numCap];
   }
 
@@ -127,6 +178,12 @@ class Machine {
     this.matched = copy.matched;
     this.matchcap = copy.matchcap;
     this.ncap = copy.ncap;
+    this.tracer = copy.tracer;
+  }
+
+  // Installs (or clears) an observer for subsequent match() calls on this instance.
+  void setTracer(Tracer tracer) {
+    this.tracer = tracer;
   }
 
   // init() reinitializes an existing Machine for re-use on a new input.
@@ -223,6 +280,7 @@ class Machine {
     matched = false;
     Arrays.fill(matchcap, 0, prog.numCap, -1);
     Queue runq = q0, nextq = q1;
+    int round = 0;
     int r = in.step(pos);
     int rune = r >> 3;
     int width = r & 7;
@@ -256,6 +314,9 @@ class Machine {
           if (advance < 0) {
             break;
           }
+          if (tracer != null) {
+            tracer.prefixSkip(pos, advance);
+          }
           pos += advance;
           r = in.step(pos);
           rune = r >> 3;
@@ -271,11 +332,28 @@ class Machine {
         if (ncap > 0) {
           matchcap[0] = pos;
         }
-        add(runq, prog.start, pos, matchcap, flag, null);
+        add(runq, prog.start, pos, matchcap, flag, null, "start");
       }
       int nextPos = pos + width;
       flag = in.context(nextPos);
+      if (tracer != null) {
+        tracer.stepBegin(round, runq.id, pos, rune);
+      }
       step(runq, nextq, pos, nextPos, rune, flag, anchor, pos == in.endPos());
+      if (tracer != null) {
+        int[][] caps = new int[nextq.size][];
+        int[] pcs = new int[nextq.size];
+        for (int k = 0; k < nextq.size; k++) {
+          Thread nt = nextq.denseThreads[k];
+          if (nt == null) {
+            pcs[k] = -1;
+          } else {
+            pcs[k] = nextq.densePcs[k];
+            caps[k] = nt.cap.clone();
+          }
+        }
+        tracer.stepEnd(round, nextq.id, nextPos, pcs, caps);
+      }
       if (width == 0) { // EOF
         break;
       }
@@ -295,8 +373,12 @@ class Machine {
       Queue tmpq = runq;
       runq = nextq;
       nextq = tmpq;
+      round++;
     }
     free(nextq);
+    if (tracer != null) {
+      tracer.finish(matched, matchcap);
+    }
     return matched;
   }
 
@@ -338,8 +420,14 @@ class Machine {
           if (ncap > 0 && (!longest || !matched || matchcap[1] < pos)) {
             t.cap[1] = pos;
             System.arraycopy(t.cap, 0, matchcap, 0, ncap);
+            if (tracer != null) {
+              tracer.matchWin(pos, t.cap.clone(), matched);
+            }
           }
           if (!longest) {
+            if (tracer != null && runq.size > j + 1) {
+              tracer.pruneTail(runq.id, j + 1);
+            }
             free(runq, j + 1);
           }
           matched = true;
@@ -365,7 +453,7 @@ class Machine {
           throw new IllegalStateException("bad inst");
       }
       if (add) {
-        t = add(nextq, i.out, nextPos, t.cap, nextCond, t);
+        t = add(nextq, i.out, nextPos, t.cap, nextCond, t, "after-rune");
       }
       if (t != null) {
         free(t);
@@ -380,12 +468,18 @@ class Machine {
   // from |pc| by following empty-width conditions satisfied by |cond|.  |pos|
   // gives the current position in the input.  |cond| is a bitmask of EMPTY_*
   // flags.
-  private Thread add(Queue q, int pc, int pos, int[] cap, int cond, Thread t) {
+  private Thread add(Queue q, int pc, int pos, int[] cap, int cond, Thread t, String kind) {
     if (pc == 0) {
       return t;
     }
     if (q.contains(pc)) {
+      if (tracer != null) {
+        tracer.dedup(q.id, pc);
+      }
       return t;
+    }
+    if (tracer != null) {
+      tracer.visit(q.id, pc, pos, kind);
     }
     int d = q.add(pc);
     Inst inst = prog.inst[pc];
@@ -398,28 +492,33 @@ class Machine {
 
       case Inst.ALT:
       case Inst.ALT_MATCH:
-        t = add(q, inst.out, pos, cap, cond, t);
-        t = add(q, inst.arg, pos, cap, cond, t);
+        t = add(q, inst.out, pos, cap, cond, t, "alt-out");
+        t = add(q, inst.arg, pos, cap, cond, t, "alt-arg");
         break;
 
       case Inst.EMPTY_WIDTH:
         if ((inst.arg & ~cond) == 0) {
-          t = add(q, inst.out, pos, cap, cond, t);
+          t = add(q, inst.out, pos, cap, cond, t, "empty");
+        } else if (tracer != null) {
+          tracer.emptyRejected(q.id, pc, inst.arg, cond);
         }
         break;
 
       case Inst.NOP:
-        t = add(q, inst.out, pos, cap, cond, t);
+        t = add(q, inst.out, pos, cap, cond, t, "nop");
         break;
 
       case Inst.CAPTURE:
         if (inst.arg < ncap) {
           int opos = cap[inst.arg];
           cap[inst.arg] = pos;
-          add(q, inst.out, pos, cap, cond, null);
+          if (tracer != null) {
+            tracer.captureSet(q.id, inst.arg, opos, pos);
+          }
+          add(q, inst.out, pos, cap, cond, null, "cap");
           cap[inst.arg] = opos;
         } else {
-          t = add(q, inst.out, pos, cap, cond, t);
+          t = add(q, inst.out, pos, cap, cond, t, "cap");
         }
         break;
 
@@ -437,6 +536,9 @@ class Machine {
           System.arraycopy(cap, 0, t.cap, 0, ncap);
         }
         q.denseThreads[d] = t;
+        if (tracer != null) {
+          tracer.park(q.id, pc, pos, t.cap.clone());
+        }
         t = null;
         break;
     }
